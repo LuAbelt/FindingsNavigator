@@ -131,7 +131,7 @@ tasks.register("generateUpdatePluginsXml") {
 tasks.register("publishLocalRepo") {
     group = "distribution"
     description = "Build plugin and publish into local-repo with updatePlugins.xml"
-    dependsOn("generateUpdatePluginsXml")
+    dependsOn("bumpSnapshotVersion", "generateUpdatePluginsXml")
 }
 
 // Optional: bump snapshot version in gradle.properties to force updates
@@ -146,8 +146,8 @@ tasks.register("bumpSnapshotVersion") {
         val props = Properties()
         propsFile.inputStream().use { props.load(it) }
         val current = (props.getProperty(bumpKey) ?: resolvedProjectVersionAtConfig)
-        val base = current.removeSuffix("-SNAPSHOT")
-        val newVersion = "${base}-SNAPSHOT.${System.currentTimeMillis()}"
+        val base = "1.0"
+        val newVersion = "${base}.${System.currentTimeMillis()}"
         props.setProperty(bumpKey, newVersion)
         propsFile.outputStream().use { props.store(it, null) }
         println("Bumped ${bumpKey}: ${current} -> ${newVersion}")

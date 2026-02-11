@@ -40,8 +40,6 @@ class FindingsPanel(private val project: Project) : SimpleToolWindowPanel(true, 
     private val categoryCheckboxes = linkedMapOf<String, JCheckBox>()
     private val tagCheckboxes = linkedMapOf<String, JCheckBox>()
 
-    // tags that should be auto-selected on next rebuild (e.g. newly added)
-    private val tagsToAutoSelect = mutableSetOf<String>()
     // persist No-tags selection across rebuilds
     private var noTagsSelected: Boolean = false
 
@@ -260,8 +258,7 @@ class FindingsPanel(private val project: Project) : SimpleToolWindowPanel(true, 
              cb.selectedIcon = null
              // select if previously selected or if newly added and scheduled for auto-select
              val wasSelected = if (wasInitialTags) true else prevTagSelected.contains(t)
-             val auto = tagsToAutoSelect.remove(t)
-             cb.isSelected = wasSelected || auto
+             cb.isSelected = wasSelected
              cb.addActionListener { rebuildTree() }
              tagCheckboxes[t] = cb
              tagPanel.add(cb)
@@ -286,8 +283,7 @@ class FindingsPanel(private val project: Project) : SimpleToolWindowPanel(true, 
 
         val filtered = service.findings.filter { f ->
              val catOk = selectedCats.isEmpty() || selectedCats.contains(f.category)
-            val tagOk = if (selectedTags.isEmpty()) true
-            else f.tags.any { it in selectedTags } || (includeNoTags && f.tags.isEmpty())
+            val tagOk = f.tags.any { it in selectedTags } || (includeNoTags && f.tags.isEmpty())
              catOk && tagOk
          }
 
@@ -517,8 +513,8 @@ class FindingsPanel(private val project: Project) : SimpleToolWindowPanel(true, 
         addButton.addActionListener {
             val t = tagField.text.trim()
             if (t.isNotEmpty()) {
-                // auto-select newly added tag in filters (add before service call so listener sees it)
-                tagsToAutoSelect.add(t)
+                // previously auto-selected newly added tag in filters; remove this to avoid changing filter state
+                // tagsToAutoSelect.add(t)
                 project.getService(FindingsService::class.java).addTag(f.id, t)
                 tagField.text = ""
                 // rebuild UI
@@ -541,8 +537,8 @@ class FindingsPanel(private val project: Project) : SimpleToolWindowPanel(true, 
             btn.isOpaque = true
             btn.border = javax.swing.BorderFactory.createEmptyBorder(2, 6, 2, 6)
             btn.addActionListener {
-                // auto-select newly added tag in filters
-                tagsToAutoSelect.add(t)
+                // previously auto-selected newly added tag in filters
+                // tagsToAutoSelect.add(t)
                 project.getService(FindingsService::class.java).addTag(f.id, t)
                 showDetails(f)
                 rebuildFilterPanels()

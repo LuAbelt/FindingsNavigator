@@ -1,5 +1,6 @@
 package com.unisaarland.se.findingsnavigator.service
 
+import com.fasterxml.jackson.dataformat.yaml.YAMLFactory
 import com.intellij.openapi.components.PersistentStateComponent
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.components.Service.Level
@@ -25,6 +26,7 @@ import java.io.File
 import com.intellij.notification.NotificationType
 import com.intellij.notification.NotificationGroupManager
 import com.intellij.openapi.diagnostic.Logger
+import org.yaml.snakeyaml.LoaderOptions
 
 interface FindingsListener : java.util.EventListener {
     fun findingsChanged()
@@ -64,8 +66,18 @@ class FindingsService(private val project: Project) : PersistentStateComponent<F
     }
 
     // YAML mapper to persist tags back to the source YAML
-    private val yamlMapper: com.fasterxml.jackson.dataformat.yaml.YAMLMapper =
-        com.fasterxml.jackson.dataformat.yaml.YAMLMapper()
+    private val yamlMapper: com.fasterxml.jackson.dataformat.yaml.YAMLMapper
+
+
+    init {
+        val loaderOptions = LoaderOptions()
+        loaderOptions.codePointLimit = 100 * 1024 * 1024 // 100 MB
+        val yamlFactory = YAMLFactory.builder()
+            .loaderOptions(loaderOptions)
+            .build()
+
+        yamlMapper = com.fasterxml.jackson.dataformat.yaml.YAMLMapper(yamlFactory)
+    }
 
     fun isAutoSaveEnabled(): Boolean = state.autoSave
     fun setAutoSave(enabled: Boolean) {
@@ -180,11 +192,16 @@ class FindingsService(private val project: Project) : PersistentStateComponent<F
             dispatcher.multicaster.findingsChanged()
             // persist back to YAML file on disk if autosave enabled
             if (state.autoSave) {
-                try {
-                    persistTagsToYaml()
-                } catch (ex: Exception) {
-                    LOG.warn("Failed to persist tags to YAML", ex)
-                    notifyError("Failed to save tags to YAML: ${ex.message}")
+                // persist in background to avoid blocking the EDT
+                ApplicationManager.getApplication().executeOnPooledThread {
+                    try {
+                        persistTagsToYaml()
+                    } catch (ex: Exception) {
+                        LOG.warn("Failed to persist tags to YAML", ex)
+                        ApplicationManager.getApplication().invokeLater {
+                            notifyError("Failed to save tags to YAML: ${ex.message}")
+                        }
+                    }
                 }
             }
         }
@@ -198,33 +215,43 @@ class FindingsService(private val project: Project) : PersistentStateComponent<F
             if (list != null && list.isEmpty()) state.tags.remove(findingId)
             dispatcher.multicaster.findingsChanged()
             if (state.autoSave) {
-                try {
-                    persistTagsToYaml()
-                } catch (ex: Exception) {
-                    LOG.warn("Failed to persist tags to YAML", ex)
-                    notifyError("Failed to save tags to YAML: ${ex.message}")
+                ApplicationManager.getApplication().executeOnPooledThread {
+                    try {
+                        persistTagsToYaml()
+                    } catch (ex: Exception) {
+                        LOG.warn("Failed to persist tags to YAML", ex)
+                        ApplicationManager.getApplication().invokeLater {
+                            notifyError("Failed to save tags to YAML: ${ex.message}")
+                        }
+                    }
                 }
             }
         }
     }
 
     private fun notifyError(msg: String) {
-        try {
-            val group = NotificationGroupManager.getInstance().getNotificationGroup("FindingsNavigator")
-            val notification = group.createNotification(msg, NotificationType.ERROR)
-            notification.notify(project)
-        } catch (t: Throwable) {
-            LOG.warn("Notification failed", t)
+        // Ensure notifications run on EDT
+        ApplicationManager.getApplication().invokeLater {
+            try {
+                val group = NotificationGroupManager.getInstance().getNotificationGroup("FindingsNavigator")
+                val notification = group.createNotification(msg, NotificationType.ERROR)
+                notification.notify(project)
+            } catch (t: Throwable) {
+                LOG.warn("Notification failed", t)
+            }
         }
     }
 
     private fun notifyInfo(msg: String) {
-        try {
-            val group = NotificationGroupManager.getInstance().getNotificationGroup("FindingsNavigator")
-            val notification = group.createNotification(msg, NotificationType.INFORMATION)
-            notification.notify(project)
-        } catch (t: Throwable) {
-            LOG.warn("Notification failed", t)
+        // Ensure notifications run on EDT
+        ApplicationManager.getApplication().invokeLater {
+            try {
+                val group = NotificationGroupManager.getInstance().getNotificationGroup("FindingsNavigator")
+                val notification = group.createNotification(msg, NotificationType.INFORMATION)
+                notification.notify(project)
+            } catch (t: Throwable) {
+                LOG.warn("Notification failed", t)
+            }
         }
     }
 
@@ -238,7 +265,10 @@ class FindingsService(private val project: Project) : PersistentStateComponent<F
         val rootNode = yamlMapper.readTree(file) as? com.fasterxml.jackson.databind.node.ObjectNode
             ?: throw java.io.IOException("Unexpected YAML structure")
 
-        for (f in _findings) {
+        // Take a snapshot of findings and their tags to avoid concurrent modification
+        val snapshot = synchronized(_findings) { _findings.map { f -> f.copy(tags = f.tags.toMutableSet()) } }
+
+        for (f in snapshot) {
             val catNode = rootNode.get(f.category) ?: continue
             if (!catNode.isArray) continue
             val arr = catNode as com.fasterxml.jackson.databind.node.ArrayNode
@@ -270,9 +300,17 @@ class FindingsService(private val project: Project) : PersistentStateComponent<F
         // Write back and refresh VFS so IDE notices changes
         try {
             yamlMapper.writeValue(file, rootNode)
+            // refresh VFS; this may be called from background thread but fine to call here
             LocalFileSystem.getInstance().refreshAndFindFileByIoFile(file)
-            notifyInfo("Findings YAML saved")
+            // Notify on EDT
+            ApplicationManager.getApplication().invokeLater {
+                notifyInfo("Findings YAML saved")
+            }
         } catch (ex: Exception) {
+            // notify on EDT
+            ApplicationManager.getApplication().invokeLater {
+                notifyError("Writing YAML failed: ${ex.message}")
+            }
             throw java.io.IOException("Writing YAML failed: ${ex.message}", ex)
         }
     }
