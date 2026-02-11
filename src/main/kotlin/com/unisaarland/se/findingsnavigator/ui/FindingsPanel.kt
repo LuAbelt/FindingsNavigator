@@ -18,6 +18,7 @@ import javax.swing.tree.DefaultMutableTreeNode
 import javax.swing.tree.DefaultTreeModel
 import java.nio.file.Paths
 import java.io.File
+import com.intellij.ui.OnePixelSplitter
 
 class FindingsPanel(private val project: Project) : SimpleToolWindowPanel(true, true) {
     val component = JPanel(BorderLayout())
@@ -82,7 +83,6 @@ class FindingsPanel(private val project: Project) : SimpleToolWindowPanel(true, 
          categoryPanel.layout = BoxLayout(categoryPanel, BoxLayout.Y_AXIS)
          tagPanel.layout = BoxLayout(tagPanel, BoxLayout.Y_AXIS)
 
-         val topPanel = JPanel(BorderLayout())
          val loadButton = JButton("Load YAML")
         // autosave toggle
         val autoSaveCb = JCheckBox("Autosave")
@@ -91,37 +91,58 @@ class FindingsPanel(private val project: Project) : SimpleToolWindowPanel(true, 
             service.setAutoSave(autoSaveCb.isSelected)
         }
 
-         val filtersPanel = JPanel(FlowLayout(FlowLayout.LEFT))
-         categoryScroll.preferredSize = java.awt.Dimension(220, 200)
-         tagScroll.preferredSize = java.awt.Dimension(220, 200)
+        // Top toolbar (keeps load/autosave controls above the split area)
+        val toolbar = JPanel(FlowLayout(FlowLayout.LEFT))
+        toolbar.add(loadButton)
+        toolbar.add(autoSaveCb)
+        component.add(toolbar, BorderLayout.NORTH)
 
-         val clearFilters = JButton("Clear Filters")
-         clearFilters.addActionListener {
-             for (cb in categoryCheckboxes.values) cb.isSelected = true
-             for (cb in tagCheckboxes.values) cb.isSelected = true
-             rebuildTree()
-         }
+        // Build the filters area: two columns (categories / tags) with adjustable width
+        categoryScroll.preferredSize = java.awt.Dimension(220, 200)
+        tagScroll.preferredSize = java.awt.Dimension(220, 200)
 
-         filtersPanel.add(JLabel("Categories:"))
-         filtersPanel.add(categoryScroll)
-         filtersPanel.add(JLabel("Tags:"))
-         filtersPanel.add(tagScroll)
-         filtersPanel.add(clearFilters)
+        val catHeader = JPanel(FlowLayout(FlowLayout.LEFT))
+        catHeader.add(JLabel("Categories:"))
+        val tagHeader = JPanel(FlowLayout(FlowLayout.LEFT))
+        tagHeader.add(JLabel("Tags:"))
 
-         topPanel.add(loadButton, BorderLayout.WEST)
-         topPanel.add(filtersPanel, BorderLayout.CENTER)
+        val categoryColumn = JPanel(BorderLayout())
+        categoryColumn.add(catHeader, BorderLayout.NORTH)
+        categoryColumn.add(categoryScroll, BorderLayout.CENTER)
 
-         val leftTop = JPanel(FlowLayout(FlowLayout.LEFT))
-         leftTop.add(loadButton)
-         leftTop.add(autoSaveCb)
-         topPanel.add(leftTop, BorderLayout.WEST)
-         topPanel.add(filtersPanel, BorderLayout.CENTER)
+        val tagColumn = JPanel(BorderLayout())
+        val clearFilters = JButton("Clear Filters")
+        clearFilters.addActionListener {
+            for (cb in categoryCheckboxes.values) cb.isSelected = true
+            for (cb in tagCheckboxes.values) cb.isSelected = true
+            rebuildTree()
+        }
+        // Put clearFilters into tag header (so both headers show)
+        tagHeader.add(clearFilters)
+        tagColumn.add(tagHeader, BorderLayout.NORTH)
+        tagColumn.add(tagScroll, BorderLayout.CENTER)
 
-         component.add(topPanel, BorderLayout.NORTH)
+        // Horizontal splitter between categories and tags (adjust individual widths)
+        val filtersSplitter = OnePixelSplitter(true, 0.5f)
+        filtersSplitter.firstComponent = categoryColumn
+        filtersSplitter.secondComponent = tagColumn
 
-         val left = JBScrollPane(tree)
-         component.add(left, BorderLayout.WEST)
-         component.add(detailsPanel, BorderLayout.CENTER)
+        val filtersContainer = JPanel(BorderLayout())
+        filtersContainer.add(filtersSplitter, BorderLayout.CENTER)
+
+        // Left vertical splitter: filters (top) and tree (bottom) so filter height is adjustable
+        val leftSplitter = OnePixelSplitter(false, 0.28f)
+        leftSplitter.firstComponent = filtersContainer
+        val treeScroll = JBScrollPane(tree)
+        treeScroll.preferredSize = java.awt.Dimension(300, 400)
+        leftSplitter.secondComponent = treeScroll
+
+        // Root splitter: left (filters+tree) and right (details) adjustable width
+        val rootSplitter = OnePixelSplitter(true, 0.32f)
+        rootSplitter.firstComponent = leftSplitter
+        rootSplitter.secondComponent = detailsPanel
+
+        component.add(rootSplitter, BorderLayout.CENTER)
 
          loadButton.addActionListener {
              val fd = com.intellij.openapi.fileChooser.FileChooserDescriptor(true, false, false, false, false, false)
