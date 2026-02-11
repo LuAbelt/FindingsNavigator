@@ -1,0 +1,17 @@
+[Unit]
+Description=Serve FindingsNavigator local-repo (simple HTTP)
+After=network.target
+
+[Service]
+# Use a shell to allow simple output redirection; run under the user instance
+Type=simple
+# Absolute path to your project serve-local-repo.sh and repo directory
+WorkingDirectory=/scratch/abeltluk/projects/research/HiddenConfig/tooling/FindingsNavigator
+# ExecStart runs the script and appends logs to local-repo/server.log
+ExecStart=/bin/bash -lc '/scratch/abeltluk/projects/research/HiddenConfig/tooling/FindingsNavigator/serve-local-repo.sh 8000 >> /scratch/abeltluk/projects/research/HiddenConfig/tooling/FindingsNavigator/local-repo/server.log 2>&1'
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+
