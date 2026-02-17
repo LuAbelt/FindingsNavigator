@@ -27,6 +27,9 @@ import com.intellij.notification.NotificationType
 import com.intellij.notification.NotificationGroupManager
 import com.intellij.openapi.diagnostic.Logger
 import org.yaml.snakeyaml.LoaderOptions
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.TimeUnit
 
 interface FindingsListener : java.util.EventListener {
     fun findingsChanged()
@@ -52,6 +55,15 @@ class FindingsService(private val project: Project) : PersistentStateComponent<F
     private val categoryIconCache: MutableMap<String, javax.swing.Icon> = mutableMapOf()
 
     private var state: State = State()
+
+    // -- Debounced-save related fields --
+    // single-thread scheduler used to serialize and debounce disk writes
+    private val saveScheduler = Executors.newSingleThreadScheduledExecutor { r ->
+        Thread(r, "FindingsService-save-thread").apply { isDaemon = true }
+    }
+    @Volatile
+    private var pendingSaveFuture: ScheduledFuture<*>? = null
+    private val saveDelayMs: Long = 1000L
 
     data class State(
         var tags: MutableMap<String, MutableList<String>> = mutableMapOf(),
@@ -92,6 +104,19 @@ class FindingsService(private val project: Project) : PersistentStateComponent<F
             .build()
 
         yamlMapper = com.fasterxml.jackson.dataformat.yaml.YAMLMapper(yamlFactory)
+
+        // Register a JVM shutdown hook to flush pending saves as a last-resort
+        try {
+            Runtime.getRuntime().addShutdownHook(Thread {
+                try {
+                    flushPendingSaves(30000)
+                } catch (t: Throwable) {
+                    LOG.warn("Flush pending saves during shutdown failed", t)
+                }
+            })
+        } catch (t: Throwable) {
+            LOG.warn("Failed to register shutdown hook for FindingsService", t)
+        }
     }
 
     fun isAutoSaveEnabled(): Boolean = state.autoSave
@@ -214,19 +239,9 @@ class FindingsService(private val project: Project) : PersistentStateComponent<F
             val list = state.tags.getOrPut(findingId) { mutableListOf() }
             if (!list.contains(tag)) list.add(tag)
             dispatcher.multicaster.findingsChanged()
-            // persist back to YAML file on disk if autosave enabled
+            // schedule a debounced save instead of immediate write
             if (state.autoSave) {
-                // persist in background to avoid blocking the EDT
-                ApplicationManager.getApplication().executeOnPooledThread {
-                    try {
-                        persistTagsToYaml()
-                    } catch (ex: Exception) {
-                        LOG.warn("Failed to persist tags to YAML", ex)
-                        ApplicationManager.getApplication().invokeLater {
-                            notifyError("Failed to save tags to YAML: ${ex.message}")
-                        }
-                    }
-                }
+                schedulePersistTags()
             }
         }
     }
@@ -239,16 +254,7 @@ class FindingsService(private val project: Project) : PersistentStateComponent<F
             if (list != null && list.isEmpty()) state.tags.remove(findingId)
             dispatcher.multicaster.findingsChanged()
             if (state.autoSave) {
-                ApplicationManager.getApplication().executeOnPooledThread {
-                    try {
-                        persistTagsToYaml()
-                    } catch (ex: Exception) {
-                        LOG.warn("Failed to persist tags to YAML", ex)
-                        ApplicationManager.getApplication().invokeLater {
-                            notifyError("Failed to save tags to YAML: ${ex.message}")
-                        }
-                    }
-                }
+                schedulePersistTags()
             }
         }
     }
@@ -276,6 +282,68 @@ class FindingsService(private val project: Project) : PersistentStateComponent<F
             } catch (t: Throwable) {
                 LOG.warn("Notification failed", t)
             }
+        }
+    }
+
+    // Schedule a debounced persist of tags to YAML. Thread-safe and coalesces frequent calls.
+    private fun schedulePersistTags() {
+        if (!state.autoSave) return
+        try {
+            // cancel previous scheduled run (non-interrupting) and schedule a new one
+            pendingSaveFuture?.cancel(false)
+        } catch (t: Throwable) {
+            LOG.warn("Failed to cancel pending save", t)
+        }
+        pendingSaveFuture = saveScheduler.schedule({
+            try {
+                persistTagsToYaml()
+            } catch (ex: Exception) {
+                LOG.warn("Failed to persist tags to YAML", ex)
+                ApplicationManager.getApplication().invokeLater {
+                    notifyError("Failed to save tags to YAML: ${ex.message}")
+                }
+            } finally {
+                pendingSaveFuture = null
+            }
+        }, saveDelayMs, TimeUnit.MILLISECONDS)
+    }
+
+    /**
+     * Flush any pending saves synchronously. This is intended to be called during shutdown.
+     * Returns true if flush completed (or there was nothing to flush), false on timeout/failure.
+     */
+    fun flushPendingSaves(timeoutMs: Long = 5000L): Boolean {
+        val futureToWait: java.util.concurrent.Future<*>? = synchronized(this) {
+            val p = pendingSaveFuture
+            if (p != null) {
+                // cancel the scheduled task (so we can run synchronously)
+                try { p.cancel(false) } catch (_: Throwable) { }
+            }
+            pendingSaveFuture = null
+            null
+        }
+
+        // Always try to run a final persist synchronously on the saveScheduler
+        val task = saveScheduler.submit {
+            try {
+                persistTagsToYaml()
+            } catch (ex: Exception) {
+                LOG.warn("Final persist failed", ex)
+                try {
+                    ApplicationManager.getApplication().invokeLater {
+                        notifyError("Failed to save tags to YAML during shutdown: ${ex.message}")
+                    }
+                } catch (_: Throwable) {
+                }
+                throw ex
+            }
+        }
+        return try {
+            task.get(timeoutMs, TimeUnit.MILLISECONDS)
+            true
+        } catch (t: Throwable) {
+            LOG.warn("Timed out waiting for final persist", t)
+            false
         }
     }
 
