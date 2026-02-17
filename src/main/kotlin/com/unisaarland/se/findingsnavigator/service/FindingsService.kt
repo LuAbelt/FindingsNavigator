@@ -63,7 +63,6 @@ class FindingsService(private val project: Project) : PersistentStateComponent<F
     }
     @Volatile
     private var pendingSaveFuture: ScheduledFuture<*>? = null
-    private val saveDelayMs: Long = 1000L
 
     data class State(
         var tags: MutableMap<String, MutableList<String>> = mutableMapOf(),
@@ -72,13 +71,21 @@ class FindingsService(private val project: Project) : PersistentStateComponent<F
         // persisted UI filter selections
         var selectedCategories: MutableList<String> = mutableListOf(),
         var selectedTags: MutableList<String> = mutableListOf(),
-        var selectedNoTags: Boolean = false
+        var selectedNoTags: Boolean = false,
+        // debounce delay for saving (milliseconds)
+        var saveDelayMs: Long = 1000L
     )
 
     override fun getState(): State = state
 
     override fun loadState(state: State) {
         this.state = state
+    }
+
+    // Accessor for the configurable save delay
+    fun getSaveDelayMs(): Long = state.saveDelayMs
+    fun setSaveDelayMs(ms: Long) {
+        state.saveDelayMs = if (ms >= 0) ms else 0L
     }
 
     // Persist and retrieve saved filter selections
@@ -246,6 +253,26 @@ class FindingsService(private val project: Project) : PersistentStateComponent<F
         }
     }
 
+    /**
+     * Add a tag to multiple findings in a single operation. Updates memory state for all provided
+     * findings and schedules exactly one debounced persist.
+     */
+    fun addTagToFindings(findingIds: Collection<String>, tag: String) {
+        var changed = false
+        for (id in findingIds) {
+            val f = _findings.find { it.id == id } ?: continue
+            if (f.tags.add(tag)) {
+                val list = state.tags.getOrPut(id) { mutableListOf() }
+                if (!list.contains(tag)) list.add(tag)
+                changed = true
+            }
+        }
+        if (changed) {
+            dispatcher.multicaster.findingsChanged()
+            if (state.autoSave) schedulePersistTags()
+        }
+    }
+
     fun removeTag(findingId: String, tag: String) {
         val f = _findings.find { it.id == findingId } ?: return
         if (f.tags.remove(tag)) {
@@ -294,6 +321,7 @@ class FindingsService(private val project: Project) : PersistentStateComponent<F
         } catch (t: Throwable) {
             LOG.warn("Failed to cancel pending save", t)
         }
+        val delay = getSaveDelayMs()
         pendingSaveFuture = saveScheduler.schedule({
             try {
                 persistTagsToYaml()
@@ -305,7 +333,7 @@ class FindingsService(private val project: Project) : PersistentStateComponent<F
             } finally {
                 pendingSaveFuture = null
             }
-        }, saveDelayMs, TimeUnit.MILLISECONDS)
+        }, delay, TimeUnit.MILLISECONDS)
     }
 
     /**

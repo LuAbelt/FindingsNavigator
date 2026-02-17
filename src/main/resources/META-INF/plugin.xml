@@ -31,5 +31,8 @@
         </toolWindow>
         <notificationGroup id="FindingsNavigator" displayType="BALLOON"/>
 
+        <!-- Project-level configurable for plugin settings -->
+        <projectConfigurable implementation="com.unisaarland.se.findingsnavigator.settings.FindingsConfigurable" displayName="Findings Navigator" />
+
     </extensions>
 </idea-plugin>

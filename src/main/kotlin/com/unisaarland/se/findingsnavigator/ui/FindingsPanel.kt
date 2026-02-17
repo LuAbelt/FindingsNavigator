@@ -586,7 +586,8 @@ class FindingsPanel(private val project: Project) : SimpleToolWindowPanel(true, 
                 }
                 if (selectedFindings.isEmpty()) selectedFindings.add(f)
                 val svc = project.getService(FindingsService::class.java)
-                for (sf in selectedFindings) svc.addTag(sf.id, t)
+                val ids = selectedFindings.map { it.id }.distinct()
+                svc.addTagToFindings(ids, t)
                 tagField.text = ""
                 // rebuild UI
                 // show details of first selected (if any)
@@ -620,7 +621,8 @@ class FindingsPanel(private val project: Project) : SimpleToolWindowPanel(true, 
                 }
                 if (selectedFindings.isEmpty()) selectedFindings.add(f)
                 val svc = project.getService(FindingsService::class.java)
-                for (sf in selectedFindings) svc.addTag(sf.id, t)
+                val ids = selectedFindings.map { it.id }.distinct()
+                svc.addTagToFindings(ids, t)
                 showDetails(selectedFindings.first())
                 rebuildFilterPanels()
                 rebuildTree()
