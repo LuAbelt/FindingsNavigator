@@ -56,7 +56,11 @@ class FindingsService(private val project: Project) : PersistentStateComponent<F
     data class State(
         var tags: MutableMap<String, MutableList<String>> = mutableMapOf(),
         var lastLoadedFile: String? = null,
-        var autoSave: Boolean = true
+        var autoSave: Boolean = true,
+        // persisted UI filter selections
+        var selectedCategories: MutableList<String> = mutableListOf(),
+        var selectedTags: MutableList<String> = mutableListOf(),
+        var selectedNoTags: Boolean = false
     )
 
     override fun getState(): State = state
@@ -64,6 +68,17 @@ class FindingsService(private val project: Project) : PersistentStateComponent<F
     override fun loadState(state: State) {
         this.state = state
     }
+
+    // Persist and retrieve saved filter selections
+    fun saveSelectedFilters(categories: Set<String>, tags: Set<String>, noTags: Boolean) {
+        state.selectedCategories = categories.toMutableList()
+        state.selectedTags = tags.toMutableList()
+        state.selectedNoTags = noTags
+    }
+
+    fun getSavedSelectedCategories(): Set<String> = state.selectedCategories.toSet()
+    fun getSavedSelectedTags(): Set<String> = state.selectedTags.toSet()
+    fun getSavedSelectedNoTags(): Boolean = state.selectedNoTags
 
     // YAML mapper to persist tags back to the source YAML
     private val yamlMapper: com.fasterxml.jackson.dataformat.yaml.YAMLMapper
@@ -158,22 +173,31 @@ class FindingsService(private val project: Project) : PersistentStateComponent<F
             val ab = categoryAbbrCache[cat] ?: "?"
             val iconWidth = 14 + (maxOf(0, ab.length - 2) * 8)
             val icon = object : javax.swing.Icon {
+                private val height = 18
+                private val padding = 6
                 override fun getIconWidth(): Int = iconWidth
-                override fun getIconHeight(): Int = 14
-                override fun paintIcon(c: java.awt.Component?, g: java.awt.Graphics?, x: Int, y: Int) {
+                override fun getIconHeight(): Int = height
+                override fun paintIcon(cmp: java.awt.Component?, g: java.awt.Graphics?, x: Int, y: Int) {
                     if (g == null) return
-                    val g2 = g.create() as java.awt.Graphics
+                    val g2 = g.create() as java.awt.Graphics2D
                     try {
-                        g2.color = color
-                        g2.fillRect(x + 1, y + 1, iconWidth - 2, 12)
-                        val textColor =
-                            if ((0.299 * color.red + 0.587 * color.green + 0.114 * color.blue) < 150) Color.white else Color.black
-                        g2.color = textColor
-                        g2.font = g2.font.deriveFont(10f)
+                        g2.setRenderingHint(java.awt.RenderingHints.KEY_ANTIALIASING, java.awt.RenderingHints.VALUE_ANTIALIAS_ON)
+                        val text = ab.take(3)
+                        g2.font = g2.font.deriveFont(11f)
                         val fm = g2.fontMetrics
-                        val tx = x + (iconWidth - fm.stringWidth(ab.take(2))) / 2
-                        val ty = y + ((14 + fm.ascent - fm.descent) / 2)
-                        g2.drawString(ab.take(2), tx, ty)
+                        val textWidth = fm.stringWidth(text)
+                        val rectW = maxOf(iconWidth, textWidth + padding * 2)
+                        val rectH = height - 4
+                        val rx = x
+                        val ry = y + 2
+                        val arc = 8
+                        g2.color = color
+                        g2.fillRoundRect(rx, ry, rectW, rectH, arc, arc)
+                        val textColor = if ((0.299 * color.red + 0.587 * color.green + 0.114 * color.blue) < 150) Color.white else Color.black
+                        g2.color = textColor
+                        val tx = rx + (rectW - textWidth) / 2
+                        val ty = ry + ((rectH + fm.ascent - fm.descent) / 2)
+                        g2.drawString(text, tx, ty)
                     } finally {
                         g2.dispose()
                     }
@@ -340,8 +364,8 @@ class FindingsService(private val project: Project) : PersistentStateComponent<F
         // fallback: take first two non-space letters
         val letters = category.filter { it.isLetter() }
         return when {
-            letters.length >= 2 -> letters.substring(0, 2).uppercase()
-            letters.isNotEmpty() -> letters.substring(0, 1).uppercase()
+            letters.length >= 3 -> letters.substring(0, 3).uppercase()
+            letters.isNotEmpty() -> letters.substring(0, 2).uppercase()
             else -> "?"
         }
     }
@@ -379,11 +403,10 @@ class FindingsService(private val project: Project) : PersistentStateComponent<F
     }
 
     fun updateEditorMarkers(showFindings: Collection<Finding>) {
-        // clear previous
-        clearEditorMarkers()
-
         // Run on EDT to be safe when manipulating editors/markup
         ApplicationManager.getApplication().invokeLater {
+            // clear previous highlighters on EDT to avoid race conditions
+            clearEditorMarkers()
             val created = mutableSetOf<Pair<Editor, Int>>()
             // fast lookup of visible finding ids
             val showIds = showFindings.map { it.id }.toSet()
@@ -431,32 +454,33 @@ class FindingsService(private val project: Project) : PersistentStateComponent<F
                                 ?: run {
                                     val col = colorForCategory(f.category)
                                     val ab = abbreviationForCategory(f.category)
-                                    val w = 14 + (maxOf(0, ab.length - 2) * 8)
+                                    val w = maxOf(22, 8 + ab.length * 10)
                                     val ic = object : javax.swing.Icon {
+                                        private val h = 18
                                         override fun getIconWidth(): Int = w
-                                        override fun getIconHeight(): Int = 14
-                                        override fun paintIcon(
-                                            c: java.awt.Component?,
-                                            g: java.awt.Graphics?,
-                                            x: Int,
-                                            y: Int
-                                        ) {
+                                        override fun getIconHeight(): Int = h
+                                        override fun paintIcon(c: java.awt.Component?, g: java.awt.Graphics?, x: Int, y: Int) {
                                             if (g == null) return
-                                            val g2 = g.create() as java.awt.Graphics
+                                            val g2 = g.create() as java.awt.Graphics2D
                                             try {
-                                                g2.color = col
-                                                g2.fillRect(x + 1, y + 1, w - 2, 12)
-                                                val textColor =
-                                                    if ((0.299 * col.red + 0.587 * col.green + 0.114 * col.blue) < 150) Color.white else Color.black
-                                                g2.color = textColor
-                                                g2.font = g2.font.deriveFont(10f)
+                                                g2.setRenderingHint(java.awt.RenderingHints.KEY_ANTIALIASING, java.awt.RenderingHints.VALUE_ANTIALIAS_ON)
+                                                val text = ab.take(3)
+                                                g2.font = g2.font.deriveFont(11f)
                                                 val fm = g2.fontMetrics
-                                                val tx = x + (w - fm.stringWidth(ab.take(2))) / 2
-                                                val ty = y + ((14 + fm.ascent - fm.descent) / 2)
-                                                g2.drawString(ab.take(2), tx, ty)
-                                            } finally {
-                                                g2.dispose()
-                                            }
+                                                val tw = fm.stringWidth(text)
+                                                val rectW = maxOf(w, tw + 12)
+                                                val rectH = h - 4
+                                                val rx = x
+                                                val ry = y + 2
+                                                val arc = 8
+                                                g2.color = col
+                                                g2.fillRoundRect(rx, ry, rectW, rectH, arc, arc)
+                                                val textColor = if ((0.299 * col.red + 0.587 * col.green + 0.114 * col.blue) < 150) Color.white else Color.black
+                                                g2.color = textColor
+                                                val tx = rx + (rectW - tw) / 2
+                                                val ty = ry + ((rectH + fm.ascent - fm.descent) / 2)
+                                                g2.drawString(text, tx, ty)
+                                            } finally { g2.dispose() }
                                         }
                                     }
                                     categoryIconCache[f.category] = ic
@@ -478,4 +502,6 @@ class FindingsService(private val project: Project) : PersistentStateComponent<F
             }
         }
     }
+
+    fun getLastLoadedFile(): String? = state.lastLoadedFile
 }

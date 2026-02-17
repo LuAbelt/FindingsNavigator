@@ -44,6 +44,11 @@ class FindingsPanel(private val project: Project) : SimpleToolWindowPanel(true, 
     // persist No-tags selection across rebuilds
     private var noTagsSelected: Boolean = false
 
+    // Small node wrapper used to show a category with its current filtered count
+    private data class CategoryNode(val name: String, val count: Int) {
+        override fun toString(): String = name
+    }
+
      // PillCheckbox: a rounded colored checkbox used in filter panels
      private inner class PillCheckbox(text: String, val pillColor: Color) : JCheckBox(text) {
          init {
@@ -116,6 +121,7 @@ class FindingsPanel(private val project: Project) : SimpleToolWindowPanel(true, 
             for (cb in categoryCheckboxes.values) cb.isSelected = true
             for (cb in tagCheckboxes.values) cb.isSelected = true
             rebuildTree()
+            saveCurrentFilters()
         }
         // Put clearFilters into tag header (so both headers show)
         tagHeader.add(clearFilters)
@@ -151,10 +157,20 @@ class FindingsPanel(private val project: Project) : SimpleToolWindowPanel(true, 
              val chosen = com.intellij.openapi.fileChooser.FileChooser.chooseFile(fd, project, null)
              if (chosen != null) {
                  service.loadFromFile(Paths.get(chosen.path))
-                rebuildFilterPanels()
-                rebuildTree()
              }
          }
+        // Auto-load last opened YAML (if exists) and restore saved filters
+        val last = service.getLastLoadedFile()
+        if (last != null) {
+            val lf = java.io.File(last)
+            if (lf.exists()) {
+                try {
+                    service.loadFromFile(Paths.get(last))
+                } catch (_: Exception) {
+                    // ignore load failures at startup
+                }
+            }
+        }
 
          tree.addTreeSelectionListener {
              val node = tree.lastSelectedPathComponent as? DefaultMutableTreeNode
@@ -177,9 +193,10 @@ class FindingsPanel(private val project: Project) : SimpleToolWindowPanel(true, 
                     val line = f.location.line ?: 0
                     val col = f.location.column ?: 0
                     comp.text = "${filename}:${line}:${col}"
-                 } else if (user is String) {
-                     val c = service.colorForCategory(user)
-                     comp.text = user
+                 } else if (user is CategoryNode) {
+                     val cnode = user as CategoryNode
+                     val c = service.colorForCategory(cnode.name)
+                     comp.text = "${cnode.name} (${cnode.count})"
                      comp.icon = object : javax.swing.Icon {
                          override fun getIconWidth() = 10
                          override fun getIconHeight() = 10
@@ -237,12 +254,20 @@ class FindingsPanel(private val project: Project) : SimpleToolWindowPanel(true, 
         rebuildFilterPanels()
     }
 
+    // Move saveCurrentFilters to a private class-level helper so all methods can call it
+    private fun saveCurrentFilters() {
+        val selectedCats = categoryCheckboxes.filterValues { it.isSelected }.keys.toSet()
+        val selectedTags = tagCheckboxes.filterValues { it.isSelected }.keys.toSet()
+        val includeNoTagsNow = (tagPanel.components.firstOrNull() as? JCheckBox)?.isSelected ?: false
+        service.saveSelectedFilters(selectedCats, selectedTags, includeNoTagsNow)
+    }
+
     private fun rebuildFilterPanels() {
          // preserve previous selection state
          val prevCatSelected = categoryCheckboxes.filterValues { it.isSelected }.keys.toSet()
          val prevTagSelected = tagCheckboxes.filterValues { it.isSelected }.keys.toSet()
          val wasInitialCats = categoryCheckboxes.isEmpty()
-         val wasInitialTags = tagCheckboxes.isEmpty()
+         val wasInitialTags = categoryCheckboxes.isEmpty()
          // remember whether the existing 'No tags' checkbox was selected
          val prevNoTags = (tagPanel.components.firstOrNull() as? JCheckBox)?.isSelected ?: false
 
@@ -254,22 +279,33 @@ class FindingsPanel(private val project: Project) : SimpleToolWindowPanel(true, 
          val cats = service.categories().sorted()
          val tags = service.allTags().sorted()
 
-         for (c in cats) {
+         val savedCats = service.getSavedSelectedCategories()
+         val savedTags = service.getSavedSelectedTags()
+         val hasSaved = savedCats.isNotEmpty() || savedTags.isNotEmpty() || service.getSavedSelectedNoTags()
+
+        for (c in cats) {
              val cb = PillCheckbox(c, service.colorForCategory(c))
              cb.icon = null
              cb.selectedIcon = null
-             cb.isSelected = if (wasInitialCats) true else prevCatSelected.contains(c)
-             cb.addActionListener { rebuildTree() }
+            cb.isSelected = if (wasInitialCats) true else prevCatSelected.contains(c)
+            cb.addActionListener { rebuildTree() }
+            cb.isSelected = when {
+                wasInitialCats && !hasSaved -> true
+                hasSaved -> savedCats.contains(c)
+                else -> prevCatSelected.contains(c)
+            }
+            cb.addActionListener { rebuildTree(); saveCurrentFilters() }
              categoryCheckboxes[c] = cb
              categoryPanel.add(cb)
          }
 
          // add a checkbox to show entries with no tags
          val noTagsCb = JCheckBox("No tags")
-         noTagsCb.isSelected = prevNoTags || noTagsSelected
+         noTagsCb.isSelected = if (hasSaved) service.getSavedSelectedNoTags() else (prevNoTags || noTagsSelected)
          noTagsCb.addActionListener {
              noTagsSelected = noTagsCb.isSelected
              rebuildTree()
+             saveCurrentFilters()
          }
          // place 'No tags' at top of tag panel
          tagPanel.add(noTagsCb)
@@ -279,8 +315,8 @@ class FindingsPanel(private val project: Project) : SimpleToolWindowPanel(true, 
              cb.selectedIcon = null
              // select if previously selected or if newly added and scheduled for auto-select
              val wasSelected = if (wasInitialTags) true else prevTagSelected.contains(t)
-             cb.isSelected = wasSelected
-             cb.addActionListener { rebuildTree() }
+             cb.isSelected = if (hasSaved) savedTags.contains(t) else wasSelected
+             cb.addActionListener { rebuildTree(); saveCurrentFilters() }
              tagCheckboxes[t] = cb
              tagPanel.add(cb)
          }
@@ -310,13 +346,17 @@ class FindingsPanel(private val project: Project) : SimpleToolWindowPanel(true, 
 
         val byCategory = filtered.groupBy { it.category }
         for ((cat, list) in byCategory) {
-            val catNode = DefaultMutableTreeNode(cat)
+            val catNode = DefaultMutableTreeNode(CategoryNode(cat, list.size))
             for (f in list) {
                 val n = DefaultMutableTreeNode(f)
                 catNode.add(n)
             }
             rootNode.add(catNode)
         }
+
+        // update root label with total
+        rootNode.userObject = "Findings (${filtered.size})"
+
         treeModel.reload()
 
         // restore expansion and selection
@@ -343,8 +383,8 @@ class FindingsPanel(private val project: Project) : SimpleToolWindowPanel(true, 
             val path = tree.getPathForRow(r)
             val node = path.lastPathComponent as? DefaultMutableTreeNode ?: continue
             val user = node.userObject
-            if (user is String && tree.isExpanded(r)) {
-                expanded.add(user)
+            if (user is CategoryNode && tree.isExpanded(r)) {
+                expanded.add(user.name)
             }
         }
         return expanded
@@ -354,7 +394,7 @@ class FindingsPanel(private val project: Project) : SimpleToolWindowPanel(true, 
         for (i in 0 until rootNode.childCount) {
             val child = rootNode.getChildAt(i) as? DefaultMutableTreeNode ?: continue
             val user = child.userObject
-            if (user is String && user in categories) {
+            if (user is CategoryNode && user.name in categories) {
                 val path = javax.swing.tree.TreePath(child.path)
                 tree.expandPath(path)
             }
@@ -385,7 +425,7 @@ class FindingsPanel(private val project: Project) : SimpleToolWindowPanel(true, 
     private fun rebuildFilters() {
         // preserve selection
         val prevCats = categoryCheckboxes.filterValues { it.isSelected }.keys.toSet()
-        val prevTags = tagCheckboxes.filterValues { it.isSelected }.keys.toSet()
+        val prevTags = categoryCheckboxes.filterValues { it.isSelected }.keys.toSet()
 
         val cats = service.categories().sorted()
         val tags = service.allTags().sorted()
@@ -534,12 +574,23 @@ class FindingsPanel(private val project: Project) : SimpleToolWindowPanel(true, 
         addButton.addActionListener {
             val t = tagField.text.trim()
             if (t.isNotEmpty()) {
-                // previously auto-selected newly added tag in filters; remove this to avoid changing filter state
-                // tagsToAutoSelect.add(t)
-                project.getService(FindingsService::class.java).addTag(f.id, t)
+                // Apply tag to all selected findings in the tree (including current one)
+                val selectedFindings = mutableListOf<Finding>()
+                val paths = tree.selectionPaths
+                if (paths != null && paths.isNotEmpty()) {
+                    for (p in paths) {
+                        val node = p.lastPathComponent as? DefaultMutableTreeNode
+                        val user = node?.userObject
+                        if (user is Finding) selectedFindings.add(user)
+                    }
+                }
+                if (selectedFindings.isEmpty()) selectedFindings.add(f)
+                val svc = project.getService(FindingsService::class.java)
+                for (sf in selectedFindings) svc.addTag(sf.id, t)
                 tagField.text = ""
                 // rebuild UI
-                showDetails(f)
+                // show details of first selected (if any)
+                showDetails(selectedFindings.first())
                 rebuildFilterPanels()
                 rebuildTree()
             }
@@ -558,10 +609,19 @@ class FindingsPanel(private val project: Project) : SimpleToolWindowPanel(true, 
             btn.isOpaque = true
             btn.border = javax.swing.BorderFactory.createEmptyBorder(2, 6, 2, 6)
             btn.addActionListener {
-                // previously auto-selected newly added tag in filters
-                // tagsToAutoSelect.add(t)
-                project.getService(FindingsService::class.java).addTag(f.id, t)
-                showDetails(f)
+                val selectedFindings = mutableListOf<Finding>()
+                val paths = tree.selectionPaths
+                if (paths != null && paths.isNotEmpty()) {
+                    for (p in paths) {
+                        val node = p.lastPathComponent as? DefaultMutableTreeNode
+                        val user = node?.userObject
+                        if (user is Finding) selectedFindings.add(user)
+                    }
+                }
+                if (selectedFindings.isEmpty()) selectedFindings.add(f)
+                val svc = project.getService(FindingsService::class.java)
+                for (sf in selectedFindings) svc.addTag(sf.id, t)
+                showDetails(selectedFindings.first())
                 rebuildFilterPanels()
                 rebuildTree()
             }
