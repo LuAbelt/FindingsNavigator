@@ -30,6 +30,7 @@ import org.yaml.snakeyaml.LoaderOptions
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
+import com.fasterxml.jackson.databind.node.ObjectNode
 
 interface FindingsListener : java.util.EventListener {
     fun findingsChanged()
@@ -55,6 +56,11 @@ class FindingsService(private val project: Project) : PersistentStateComponent<F
     private val categoryIconCache: MutableMap<String, javax.swing.Icon> = mutableMapOf()
 
     private var state: State = State()
+    // map from finding id -> YAML ObjectNode (not persisted)
+    private val nodeMap: MutableMap<String, ObjectNode> = mutableMapOf()
+    // Root ObjectNode returned by the parser for the last loaded YAML. Prefer writing this tree back
+    // to preserve identity of ObjectNodes used in nodeMap.
+    private var lastLoadedRoot: ObjectNode? = null
 
     // -- Debounced-save related fields --
     // single-thread scheduler used to serialize and debounce disk writes
@@ -141,9 +147,14 @@ class FindingsService(private val project: Project) : PersistentStateComponent<F
 
     fun loadFromFile(path: Path) {
         val file = path.toFile()
-        val parsed = FindingsYamlParser.parse(file)
+        val result = FindingsYamlParser.parse(file)
         _findings.clear()
-        _findings.addAll(parsed)
+        _findings.addAll(result.findings)
+        nodeMap.clear()
+        nodeMap.putAll(result.nodeMap)
+        lastLoadedRoot = result.root
+
+        LOG.info("Loaded ${_findings.size} findings from ${file.absolutePath}")
 
         // build index for fast lookup per-file
         buildIndex()
@@ -246,6 +257,7 @@ class FindingsService(private val project: Project) : PersistentStateComponent<F
             val list = state.tags.getOrPut(findingId) { mutableListOf() }
             if (!list.contains(tag)) list.add(tag)
             dispatcher.multicaster.findingsChanged()
+            LOG.info("addTag: id=$findingId tag=$tag autoSave=${state.autoSave}")
             // schedule a debounced save instead of immediate write
             if (state.autoSave) {
                 schedulePersistTags()
@@ -269,7 +281,8 @@ class FindingsService(private val project: Project) : PersistentStateComponent<F
         }
         if (changed) {
             dispatcher.multicaster.findingsChanged()
-            if (state.autoSave) schedulePersistTags()
+            LOG.info("addTagToFindings: ids=${findingIds.joinToString(",")} tag=$tag autoSave=${state.autoSave}")
+            if (state.autoSave) schedulePersistTags() else LOG.info("addTagToFindings: autosave disabled, not scheduling persist")
         }
     }
 
@@ -280,6 +293,7 @@ class FindingsService(private val project: Project) : PersistentStateComponent<F
             list?.remove(tag)
             if (list != null && list.isEmpty()) state.tags.remove(findingId)
             dispatcher.multicaster.findingsChanged()
+            LOG.info("removeTag: id=$findingId tag=$tag autoSave=${state.autoSave}")
             if (state.autoSave) {
                 schedulePersistTags()
             }
@@ -314,7 +328,7 @@ class FindingsService(private val project: Project) : PersistentStateComponent<F
 
     // Schedule a debounced persist of tags to YAML. Thread-safe and coalesces frequent calls.
     private fun schedulePersistTags() {
-        if (!state.autoSave) return
+        if (!state.autoSave) { LOG.info("schedulePersistTags: autosave disabled, skipping"); return }
         try {
             // cancel previous scheduled run (non-interrupting) and schedule a new one
             pendingSaveFuture?.cancel(false)
@@ -324,6 +338,7 @@ class FindingsService(private val project: Project) : PersistentStateComponent<F
         val delay = getSaveDelayMs()
         LOG.info("Scheduling persist of tags in $delay ms")
         pendingSaveFuture = saveScheduler.schedule({
+            LOG.info("Debounced persist runnable started on thread=${Thread.currentThread().name}")
             try {
                 persistTagsToYaml()
             } catch (ex: Exception) {
@@ -335,6 +350,14 @@ class FindingsService(private val project: Project) : PersistentStateComponent<F
                 pendingSaveFuture = null
             }
         }, delay, TimeUnit.MILLISECONDS)
+        // Log scheduled future state for debugging
+        try {
+            val f = pendingSaveFuture
+            if (f == null) LOG.info("schedulePersistTags: scheduled future is null immediately after scheduling (unexpected)")
+            else LOG.info("schedulePersistTags: scheduled future created, isDone=${f.isDone}, isCancelled=${f.isCancelled}")
+        } catch (t: Throwable) {
+            LOG.warn("schedulePersistTags: failed to inspect scheduled future", t)
+        }
     }
 
     /**
@@ -383,38 +406,79 @@ class FindingsService(private val project: Project) : PersistentStateComponent<F
         val file = File(path)
         if (!file.exists()) throw java.io.IOException("YAML file does not exist: $path")
 
-        val rootNode = yamlMapper.readTree(file)
-            ?: throw java.io.IOException("Unexpected YAML structure")
+        // Prefer the in-memory parsed root (so ObjectNode references in nodeMap are valid).
+        val rootNode = lastLoadedRoot ?: run {
+            val n = yamlMapper.readTree(file)
+            if (n == null || !n.isObject) throw java.io.IOException("Unexpected YAML structure")
+            n as com.fasterxml.jackson.databind.node.ObjectNode
+        }
 
         LOG.info("Persisting ${_findings.size} finding(s) to YAML: $path")
 
         // Take a snapshot of findings and their tags to avoid concurrent modification
         val snapshot = synchronized(_findings) { _findings.map { f -> f.copy(tags = f.tags.toMutableSet()) } }
 
-        // Helper to attempt to match a JSON/YAML object node against a finding by location
+        val mapper = yamlMapper
+        // First, update nodes that we have a direct pointer for
+        val updatedIds = mutableSetOf<String>()
+        var directUpdates = 0
+        for (f in snapshot) {
+            val node = nodeMap[f.id]
+            if (node != null) {
+                val tagsArray = mapper.createArrayNode()
+                for (t in f.tags) tagsArray.add(t)
+                node.set<com.fasterxml.jackson.databind.JsonNode>("tags", tagsArray)
+                updatedIds.add(f.id)
+                directUpdates++
+            }
+        }
+        LOG.info("Directly updated $directUpdates nodes from nodeMap")
+
+        // For findings that didn't have a direct node pointer, fall back to traversal-based matching
+        val remaining = snapshot.filter { it.id !in updatedIds }
+
         fun nodeMatchesFinding(item: com.fasterxml.jackson.databind.JsonNode, f: Finding): Boolean {
             if (!item.isObject) return false
             val locationNode = item.get("Location") ?: item.get("location")
-            val filename = locationNode?.get("Filename")?.asText()
-                ?: locationNode?.get("filename")?.asText()
-                ?: item.get("file")?.asText()
-                ?: return false
-            val linenoNode = locationNode.get("Lineno") ?: locationNode.get("lineno")
-            val colnoNode = locationNode.get("Colno") ?: locationNode.get("colno")
+            val filenameNode = locationNode?.get("Filename") ?: locationNode?.get("filename") ?: item.get("file")
+            val filename = filenameNode?.asText() ?: return false
+            val linenoNode = locationNode?.get("Lineno") ?: locationNode?.get("lineno")
+            val colnoNode = locationNode?.get("Colno") ?: locationNode?.get("colno")
             val lineno = linenoNode?.asInt()
             val colno = colnoNode?.asInt()
 
-            return filename == f.location.filename && ((lineno == null && f.location.line == null) || (lineno != null && f.location.line == lineno)) && ((colno == null && f.location.column == null) || (colno != null && f.location.column == colno))
+            fun normalize(p: String?): String? {
+                if (p == null) return null
+                try {
+                    val fileP = File(p)
+                    if (fileP.isAbsolute) return try { fileP.canonicalPath } catch (_: Exception) { fileP.path }
+                    val base = project.basePath
+                    if (base != null) {
+                        val joined = File(base, p)
+                        return try { joined.canonicalPath } catch (_: Exception) { joined.path }
+                    }
+                    return p
+                } catch (_: Exception) { return p }
+            }
+
+            val normYaml = normalize(filename)
+            val normFind = normalize(f.location.filename)
+
+            val matchesFilename = when {
+                normYaml != null && normFind != null && normYaml == normFind -> true
+                normYaml != null && normFind != null && normYaml.endsWith(normFind) -> true
+                File(filename).name == File(f.location.filename).name -> true
+                else -> false
+            }
+
+            return matchesFilename && ((lineno == null && f.location.line == null) || (lineno != null && f.location.line == lineno)) && ((colno == null && f.location.column == null) || (colno != null && f.location.column == colno))
         }
 
-        // Traverse the tree and for each object node attempt to match each finding. This is more robust
-        // in case the YAML groups are not strictly top-level by category.
-        val mapper = yamlMapper
         val nodesToUpdate = mutableListOf<Pair<com.fasterxml.jackson.databind.node.ObjectNode, Finding>>()
 
         fun traverse(node: com.fasterxml.jackson.databind.JsonNode) {
             if (node.isObject) {
-                for (f in snapshot) {
+                for (f in remaining) {
                     try {
                         if (nodeMatchesFinding(node, f)) {
                             nodesToUpdate.add(node as com.fasterxml.jackson.databind.node.ObjectNode to f)
@@ -439,8 +503,10 @@ class FindingsService(private val project: Project) : PersistentStateComponent<F
             val tagsArray = mapper.createArrayNode()
             for (t in f.tags) tagsArray.add(t)
             objItem.set<com.fasterxml.jackson.databind.JsonNode>("tags", tagsArray)
+            updatedIds.add(f.id)
         }
-        LOG.info("Found ${nodesToUpdate.size} YAML nodes to update")
+
+        LOG.info("Direct updates=${directUpdates}, traversal updates=${nodesToUpdate.size}, total updated=${updatedIds.size}")
 
         // Write back and refresh VFS so IDE notices changes
         try {

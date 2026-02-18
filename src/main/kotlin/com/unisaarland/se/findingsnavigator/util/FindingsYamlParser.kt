@@ -1,6 +1,7 @@
 package com.unisaarland.se.findingsnavigator.util
 
 import com.fasterxml.jackson.databind.JsonNode
+import com.fasterxml.jackson.databind.node.ObjectNode
 import com.fasterxml.jackson.dataformat.yaml.YAMLFactory
 import com.fasterxml.jackson.dataformat.yaml.YAMLMapper
 import com.unisaarland.se.findingsnavigator.model.Finding
@@ -9,11 +10,15 @@ import org.yaml.snakeyaml.LoaderOptions
 import java.io.File
 
 object FindingsYamlParser {
+    data class ParseResult(val findings: List<Finding>, val nodeMap: Map<String, ObjectNode>, val root: ObjectNode?)
+
     /**
      * Parse a findings YAML file into a list of Finding objects.
      * The input is expected to be a mapping from category -> list of entries.
+     * Returns the findings and a mapping from generated finding id -> the underlying ObjectNode
+     * representing the YAML entry so callers can update the node directly.
      */
-    fun parse(file: File): List<Finding> {
+    fun parse(file: File): ParseResult {
 
         val loaderOptions = LoaderOptions()
         loaderOptions.codePointLimit = 100 * 1024 * 1024 // 100 MB
@@ -26,6 +31,7 @@ object FindingsYamlParser {
         val root: JsonNode = yamlMapper.readTree(file)
 
         val findings = mutableListOf<Finding>()
+        val nodeMap = mutableMapOf<String, ObjectNode>()
 
         if (root.isObject) {
             val fields = root.fields()
@@ -70,10 +76,14 @@ object FindingsYamlParser {
                     val loc = Location(filename, lineno, colno)
                     val f = Finding(id = id, category = category, location = loc, tags = tags, extras = extras)
                     findings.add(f)
+
+                    if (item.isObject) {
+                        nodeMap[id] = item as ObjectNode
+                    }
                 }
             }
         }
 
-        return findings
+        return ParseResult(findings.toList(), nodeMap, if (root.isObject) root as ObjectNode else null)
     }
 }
