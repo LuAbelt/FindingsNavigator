@@ -103,7 +103,7 @@ tasks.register("generateUpdatePluginsXml") {
         for (zip in zips) {
             val fileName = zip.name
             val id = resolvedPluginId
-            val versionStr = resolvedPluginVersionAtConfig ?: fileName.removeSuffix(".zip").substringAfterLast("-")
+            val versionStr = fileName.removeSuffix(".zip").substringAfterLast("-")
             val sinceBuild = resolvedSinceBuildAtConfig
             val sizeBytes = zip.length()
 
