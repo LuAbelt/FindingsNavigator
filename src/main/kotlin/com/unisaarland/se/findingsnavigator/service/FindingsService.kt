@@ -322,6 +322,7 @@ class FindingsService(private val project: Project) : PersistentStateComponent<F
             LOG.warn("Failed to cancel pending save", t)
         }
         val delay = getSaveDelayMs()
+        LOG.info("Scheduling persist of tags in $delay ms")
         pendingSaveFuture = saveScheduler.schedule({
             try {
                 persistTagsToYaml()
@@ -382,50 +383,76 @@ class FindingsService(private val project: Project) : PersistentStateComponent<F
         val file = File(path)
         if (!file.exists()) throw java.io.IOException("YAML file does not exist: $path")
 
-        val rootNode = yamlMapper.readTree(file) as? com.fasterxml.jackson.databind.node.ObjectNode
+        val rootNode = yamlMapper.readTree(file)
             ?: throw java.io.IOException("Unexpected YAML structure")
+
+        LOG.info("Persisting ${_findings.size} finding(s) to YAML: $path")
 
         // Take a snapshot of findings and their tags to avoid concurrent modification
         val snapshot = synchronized(_findings) { _findings.map { f -> f.copy(tags = f.tags.toMutableSet()) } }
 
-        for (f in snapshot) {
-            val catNode = rootNode.get(f.category) ?: continue
-            if (!catNode.isArray) continue
-            val arr = catNode as com.fasterxml.jackson.databind.node.ArrayNode
-            for (i in 0 until arr.size()) {
-                val item = arr.get(i)
-                if (item == null || !item.isObject) continue
-                val locationNode = item.get("Location") ?: item.get("location")
-                if (locationNode == null) continue
-                val filename = locationNode.get("Filename")?.asText()
-                    ?: locationNode.get("filename")?.asText()
-                    ?: item.get("file")?.asText()
-                    ?: continue
-                val linenoNode = locationNode.get("Lineno") ?: locationNode.get("lineno")
-                val colnoNode = locationNode.get("Colno") ?: locationNode.get("colno")
-                val lineno = linenoNode?.asInt()
-                val colno = colnoNode?.asInt()
+        // Helper to attempt to match a JSON/YAML object node against a finding by location
+        fun nodeMatchesFinding(item: com.fasterxml.jackson.databind.JsonNode, f: Finding): Boolean {
+            if (!item.isObject) return false
+            val locationNode = item.get("Location") ?: item.get("location")
+            val filename = locationNode?.get("Filename")?.asText()
+                ?: locationNode?.get("filename")?.asText()
+                ?: item.get("file")?.asText()
+                ?: return false
+            val linenoNode = locationNode.get("Lineno") ?: locationNode.get("lineno")
+            val colnoNode = locationNode.get("Colno") ?: locationNode.get("colno")
+            val lineno = linenoNode?.asInt()
+            val colno = colnoNode?.asInt()
 
-                if (filename == f.location.filename && ((lineno == null && f.location.line == null) || (lineno != null && f.location.line == lineno)) && ((colno == null && f.location.column == null) || (colno != null && f.location.column == colno))) {
-                    // Match found - update tags array
-                    val objItem = item as com.fasterxml.jackson.databind.node.ObjectNode
-                    val tagsArray = yamlMapper.createArrayNode()
-                    for (t in f.tags) tagsArray.add(t)
-                    objItem.set<com.fasterxml.jackson.databind.JsonNode>("tags", tagsArray)
-                    break
+            return filename == f.location.filename && ((lineno == null && f.location.line == null) || (lineno != null && f.location.line == lineno)) && ((colno == null && f.location.column == null) || (colno != null && f.location.column == colno))
+        }
+
+        // Traverse the tree and for each object node attempt to match each finding. This is more robust
+        // in case the YAML groups are not strictly top-level by category.
+        val mapper = yamlMapper
+        val nodesToUpdate = mutableListOf<Pair<com.fasterxml.jackson.databind.node.ObjectNode, Finding>>()
+
+        fun traverse(node: com.fasterxml.jackson.databind.JsonNode) {
+            if (node.isObject) {
+                for (f in snapshot) {
+                    try {
+                        if (nodeMatchesFinding(node, f)) {
+                            nodesToUpdate.add(node as com.fasterxml.jackson.databind.node.ObjectNode to f)
+                        }
+                    } catch (_: Exception) {}
                 }
+                val it = node.fields()
+                while (it.hasNext()) {
+                    val en = it.next()
+                    traverse(en.value)
+                }
+            } else if (node.isArray) {
+                val arr = node as com.fasterxml.jackson.databind.node.ArrayNode
+                for (i in 0 until arr.size()) traverse(arr.get(i))
             }
         }
+
+        traverse(rootNode)
+
+        // Apply updates: set 'tags' array for each matched node
+        for ((objItem, f) in nodesToUpdate) {
+            val tagsArray = mapper.createArrayNode()
+            for (t in f.tags) tagsArray.add(t)
+            objItem.set<com.fasterxml.jackson.databind.JsonNode>("tags", tagsArray)
+        }
+        LOG.info("Found ${nodesToUpdate.size} YAML nodes to update")
 
         // Write back and refresh VFS so IDE notices changes
         try {
             yamlMapper.writeValue(file, rootNode)
-            // refresh VFS; this may be called from background thread but fine to call here
-            LocalFileSystem.getInstance().refreshAndFindFileByIoFile(file)
+            // refresh VFS; explicitly refresh the virtual file so the IDE notices content changes
+            val vfile = LocalFileSystem.getInstance().refreshAndFindFileByIoFile(file)
+            try { vfile?.refresh(false, false) } catch (_: Exception) {}
             // Notify on EDT
             ApplicationManager.getApplication().invokeLater {
                 notifyInfo("Findings YAML saved")
             }
+            LOG.info("Persisted findings to YAML: ${file.absolutePath}")
         } catch (ex: Exception) {
             // notify on EDT
             ApplicationManager.getApplication().invokeLater {
@@ -600,4 +627,29 @@ class FindingsService(private val project: Project) : PersistentStateComponent<F
     }
 
     fun getLastLoadedFile(): String? = state.lastLoadedFile
+
+    /**
+     * Force a synchronous persist on the saveScheduler and wait up to [timeoutMs] milliseconds.
+     * Returns true if persist completed successfully, false otherwise.
+     */
+    fun persistNowSync(timeoutMs: Long = 5000L): Boolean {
+        // cancel a pending scheduled task (we'll run synchronously)
+        try {
+            pendingSaveFuture?.cancel(false)
+        } catch (_: Throwable) {}
+        val task = saveScheduler.submit {
+            persistTagsToYaml()
+        }
+        return try {
+            task.get(timeoutMs, TimeUnit.MILLISECONDS)
+            true
+        } catch (t: Throwable) {
+            LOG.warn("persistNowSync failed", t)
+            false
+        }
+    }
+
+    fun debugStatus(): String {
+        return "lastLoadedFile=${state.lastLoadedFile}, autoSave=${state.autoSave}, pendingSave=${pendingSaveFuture != null}, savedEntries=${state.tags.size}, findings=${_findings.size}"
+    }
 }

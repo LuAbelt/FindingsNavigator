@@ -97,9 +97,12 @@ class FindingsPanel(private val project: Project) : SimpleToolWindowPanel(true, 
         }
 
         // Top toolbar (keeps load/autosave controls above the split area)
+        val saveNowBtn = JButton("Save Now")
+        saveNowBtn.toolTipText = "Force a synchronous save of pending changes to the YAML file"
         val toolbar = JPanel(FlowLayout(FlowLayout.LEFT))
         toolbar.add(loadButton)
         toolbar.add(autoSaveCb)
+        toolbar.add(saveNowBtn)
         component.add(toolbar, BorderLayout.NORTH)
 
         // Build the filters area: two columns (categories / tags) with adjustable width
